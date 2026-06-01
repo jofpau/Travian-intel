@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Travian War Intel</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; margin: 0; padding: 0; }
+body { background: #0a0b0d; color: #e5e7eb; font-family: 'Segoe UI', sans-serif; height: 100vh; overflow: hidden; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+@keyframes bounce { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-4px)} }
+::-webkit-scrollbar { width: 3px; }
+::-webkit-scrollbar-thumb { background: #374151; border-radius: 2px; }
+textarea, button, input { font-family: inherit; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+
+const SHEETS_URL = "https://script.google.com/macros/s/AKfycbxPmDTeRggxc68FDnSzXRxV9JDSOX0Mf4hMNPWRgJXr2rbh9Bje2_ekH_XDz2M1KulMqA/exec";
+
+const SYSTEM_PROMPT = `You are a Travian war intelligence assistant. Today: ${new Date().toISOString().split("T")[0]}.
+
+Each hammer entry:
+- player (REQUIRED), villa e.g. "(100|200)" (REQUIRED), alliance e.g. "[UNIR]"
+- race: Romans/Teutons/Gauls, units, strength, lastSeen, cropUsage, hitsWith, deadDate, hospital
+- source: scout/battle/manual, reinforcementWarning: true if same-race reinforcements possible, notes
+
+RACE UNIT ORDERS:
+Romans: Legionnaire,Praetorian,Imperian,Equites Legati,Equites Imperatoris,Equites Caesaris,Battering Ram,Fire Catapult,Senator,Settler
+Teutons: Clubswinger,Spearman,Axeman,Scout,Paladin,Teutonic Knight,Ram,Catapult,Chief,Settler
+Gauls: Phalanx,Swordsman,Pathfinder,Theutates Thunder,Druidrider,Haeduan,Ram,Trebuchet,Chieftain,Settler
+
+SCREENSHOT HANDLING:
+- Scout report: source=scout, extract alliance/troops by race order, reinforcementWarning=true if same race possible
+- Battle report: source=battle, subtract losses from troop counts
+- Ask race before reading units if unknown. NEVER save without villa. Ask if missing.
+
+Respond with brief military-style message then if data changes:
+INTEL_UPDATE_JSON:
+{"action":"add"|"update"|"delete"|"none"|"need_info","player":"...","villa":"...","updates":{...}}`;
+
+const DEF_PROMPT = `You are a Travian defense briefing assistant. Search hammer database for threats.
+Format: PRIMARY THREAT / COORDINATED HAMMERS / ASSESSMENT.
+Flag reinforcementWarning with ⚠️. Be fast and actionable.`;
+
+const { useState, useRef, useEffect } = React;
+
+function parseAIResponse(text) {
+  const marker = "INTEL_UPDATE_JSON:";
+  const idx = text.indexOf(marker);
+  if (idx === -1) return { message: text.trim(), update: null };
+  const message = text.slice(0, idx).trim();
+  try {
+    const clean = text.slice(idx + marker.length).replace(/```json|```/g, "").trim();
+    return { message, update: JSON.parse(clean) };
+  } catch(e) { return { message, update: null }; }
+}
+
+function applyUpdate(hammers, update) {
+  if (!update || ["none","need_info"].includes(update.action)) return hammers;
+  if ((update.action === "add" || update.action === "update") && !update.villa) return hammers;
+  const key = h => (h.player + "__" + h.villa).toLowerCase();
+  const tk = (update.player + "__" + update.villa).toLowerCase();
+  if (update.action === "add") {
+    const exists = hammers.find(h => key(h) === tk);
+    if (exists) return hammers.map(h => key(h) === tk ? {...h, ...update.updates} : h);
+    return [...hammers, { player: update.player, villa: update.villa, ...update.updates }];
+  }
+  if (update.action === "update") return hammers.map(h => key(h) === tk ? {...h, ...update.updates} : h);
+  if (update.action === "delete") return hammers.filter(h => key(h) !== tk);
+  return hammers;
+}
+
+const tc = s => {
+  if (!s) return "#6b7280";
+  const v = String(s).toLowerCase();
+  if (v.includes("high") || v.includes("critical")) return "#ef4444";
+  if (v.includes("med")) return "#f59e0b";
+  if (v.includes("low")) return "#22c55e";
+  return "#60a5fa";
+};
+const raceEmoji = r => ({Romans:"🦅",Teutons:"🪓",Gauls:"⚡"}[r] || "❓");
+const srcLabel = s => ({scout:"🔍 Scout",battle:"⚔️ Battle",manual:"✏️ Manual"}[s] || "");
+
+const FIELDS = {alliance:"Alliance",race:"Race",units:"Units",strength:"Strength",lastSeen:"Last Seen",cropUsage:"Crop/h",hitsWith:"Hits With",deadDate:"Dead Date",hospital:"Hospital",source:"Source",notes:"Notes"};
+
+function fileToBase64(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result.split(",")[1]);
+    r.onerror = rej;
+    r.readAsDataURL(file);
+  });
+}
+
+async function loadHammers() {
+  const res = await fetch(SHEETS_URL + "?action=load");
+  const data = await res.json();
+  return data.hammers || [];
+}
+
+async function saveHammers(hammers) {
+  await fetch(SHEETS_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "save", hammers })
+  });
+}
+
+function ShareButton() {
+  const [copied, setCopied] = useState(false);
+  function share() {
+    const url = window.location.href;
+    const done = () => { setCopied(true); setTimeout(() => setCopied(false), 2000); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(done);
+    } else {
+      const el = document.createElement("textarea");
+      el.value = url; el.style.cssText = "position:fixed;opacity:0";
+      document.body.appendChild(el); el.focus(); el.select();
+      try { document.execCommand("copy"); done(); } catch(e) {}
+      document.body.removeChild(el);
+    }
+  }
+  return (
+    <button onClick={share} style={{background:copied?"rgba(34,197,94,0.15)":"rgba(239,68,68,0.1)",border:copied?"1px solid rgba(34,197,94,0.4)":"1px solid rgba(239,68,68,0.25)",color:copied?"#22c55e":"#fca5a5",borderRadius:6,padding:"3px 10px",fontSize:10,fontWeight:700,letterSpacing:1,cursor:"pointer",transition:"all 0.2s",whiteSpace:"nowrap",fontFamily:"'Courier New',monospace"}}>
+      {copied ? "✓ COPIED!" : "🔗 SHARE"}
+    </button>
+  );
+}
+
+function HammerList({ hammers, onSelect, onCleanDB, onImport }) {
+  const [filter, setFilter] = useState("ALL");
+  const [showImport, setShowImport] = useState(false);
+  const [importText, setImportText] = useState("");
+  const [importMsg, setImportMsg] = useState("");
+  const alliances = ["ALL", ...Array.from(new Set(hammers.map(h => h.alliance).filter(Boolean))).sort()];
+  const filtered = filter === "ALL" ? hammers : hammers.filter(h => h.alliance === filter);
+  const grouped = {};
+  filtered.forEach(h => { const a = h.alliance || "No Alliance"; if (!grouped[a]) grouped[a] = []; grouped[a].push(h); });
+
+  function doExport() {
+    const text = JSON.stringify(hammers, null, 2);
+    const done = () => alert("Copied! Paste into Import on new app.");
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done);
+    } else {
+      const el = document.createElement("textarea");
+      el.value = text; el.style.cssText = "position:fixed;opacity:0";
+      document.body.appendChild(el); el.focus(); el.select();
+      try { document.execCommand("copy"); done(); } catch(e) {}
+      document.body.removeChild(el);
+    }
+  }
+
+  function doImport() {
+    try {
+      const data = JSON.parse(importText.trim());
+      if (!Array.isArray(data)) throw new Error();
+      onImport(data);
+      setImportMsg("Imported " + data.length + " hammers!");
+      setImportText("");
+      setTimeout(() => { setShowImport(false); setImportMsg(""); }, 2000);
+    } catch(e) { setImportMsg("Invalid data."); }
+  }
+
+  return (
+    <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
+      <div style={{padding:"8px 12px",display:"flex",gap:6,overflowX:"auto",borderBottom:"1px solid rgba(255,255,255,0.05)",flexShrink:0}}>
+        {alliances.map(a => (
+          <button key={a} onClick={() => setFilter(a)} style={{background:filter===a?"rgba(239,68,68,0.2)":"rgba(255,255,255,0.04)",border:filter===a?"1px solid rgba(239,68,68,0.5)":"1px solid rgba(255,255,255,0.08)",color:filter===a?"#fca5a5":"#6b7280",borderRadius:20,padding:"4px 12px",fontSize:11,cursor:"pointer",whiteSpace:"nowrap",fontFamily:"'Courier New',monospace",flexShrink:0}}>
+            {a}
+          </button>
+        ))}
+      </div>
+      <div style={{flex:1,overflowY:"auto",padding:"10px 12px"}}>
+        {hammers.length === 0 ? (
+          <div style={{color:"#374151",fontSize:13,textAlign:"center",marginTop:60,fontFamily:"'Courier New',monospace",lineHeight:2}}>
+            NO HAMMERS TRACKED<br/><span style={{fontSize:11}}>Go to Intel tab and send a scout screenshot</span>
+          </div>
+        ) : Object.entries(grouped).map(([alliance, hs]) => (
+          <div key={alliance}>
+            <div style={{color:"#4b5563",fontSize:10,letterSpacing:2,fontFamily:"'Courier New',monospace",padding:"6px 2px 4px",borderBottom:"1px solid rgba(255,255,255,0.05)",marginBottom:8}}>
+              {alliance.toUpperCase()} · {hs.length} HAMMER{hs.length!==1?"S":""}
+            </div>
+            {hs.map((h, i) => {
+              const col = tc(h.strength);
+              return (
+                <div key={i} onClick={() => onSelect(h)} style={{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.08)",borderLeft:"3px solid "+col,borderRadius:8,padding:"11px 14px",marginBottom:8,cursor:"pointer"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                    <div>
+                      <div style={{display:"flex",alignItems:"center",gap:6}}>
+                        <span style={{fontSize:14}}>{raceEmoji(h.race)}</span>
+                        <span style={{fontFamily:"'Courier New',monospace",fontWeight:700,color:"#e5e7eb",fontSize:14}}>{h.player}</span>
+                        {h.reinforcementWarning && <span>⚠️</span>}
+                      </div>
+                      <div style={{color:"#9ca3af",fontSize:11,marginTop:2}}>📍 {h.villa}</div>
+                    </div>
+                    <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:4}}>
+                      <div style={{background:col+"22",color:col,fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:4,border:"1px solid "+col+"44",textTransform:"uppercase"}}>{h.strength||"?"}</div>
+                      {h.source && <div style={{fontSize:9,color:"#4b5563"}}>{srcLabel(h.source)}</div>}
+                    </div>
+                  </div>
+                  {h.units && <div style={{color:"#d1d5db",fontSize:11,marginTop:7,fontFamily:"'Courier New',monospace"}}>⚔️ {h.units}</div>}
+                  <div style={{display:"flex",gap:10,marginTop:5,flexWrap:"wrap"}}>
+                    {h.cropUsage && <span style={{color:"#86efac",fontSize:11}}>🌾 {h.cropUsage}</span>}
+                    {h.deadDate && <span style={{color:"#fca5a5",fontSize:11}}>💀 {h.deadDate}</span>}
+                    {h.lastSeen && <span style={{color:"#93c5fd",fontSize:11}}>👁 {h.lastSeen}</span>}
+                  </div>
+                  <div style={{color:"#374151",fontSize:10,marginTop:5,textAlign:"right"}}>tap for details →</div>
+                </div>
+              );
+            })}
+          </div>
+        ))}
+        <button onClick={onCleanDB} style={{width:"100%",marginTop:8,background:"rgba(255,255,255,0.02)",border:"1px dashed rgba(255,255,255,0.08)",color:"#4b5563",borderRadius:8,padding:"10px",fontSize:11,cursor:"pointer",fontFamily:"'Courier New',monospace",letterSpacing:1}}>🧹 CLEAN DB</button>
+        <div style={{display:"flex",gap:8,marginTop:8}}>
+          <button onClick={doExport} style={{flex:1,background:"rgba(96,165,250,0.08)",border:"1px dashed rgba(96,165,250,0.2)",color:"#60a5fa",borderRadius:8,padding:"10px",fontSize:11,cursor:"pointer",fontFamily:"'Courier New',monospace"}}>📤 EXPORT</button>
+          <button onClick={() => setShowImport(v => !v)} style={{flex:1,background:"rgba(96,165,250,0.08)",border:"1px dashed rgba(96,165,250,0.2)",color:"#60a5fa",borderRadius:8,padding:"10px",fontSize:11,cursor:"pointer",fontFamily:"'Courier New',monospace"}}>📥 IMPORT</button>
+        </div>
+        {showImport && (
+          <div style={{marginTop:8,background:"rgba(96,165,250,0.05)",border:"1px solid rgba(96,165,250,0.15)",borderRadius:8,padding:"12px"}}>
+            <div style={{color:"#60a5fa",fontSize:11,fontFamily:"'Courier New',monospace",marginBottom:8}}>Paste exported data:</div>
+            <textarea value={importText} onChange={e => setImportText(e.target.value)} rows={5} style={{width:"100%",background:"rgba(0,0,0,0.3)",border:"1px solid rgba(96,165,250,0.2)",borderRadius:6,color:"#e5e7eb",padding:"8px",fontSize:12,resize:"vertical",outline:"none",fontFamily:"monospace"}}/>
+            {importMsg && <div style={{fontSize:12,color:importMsg.startsWith("Imp")?"#22c55e":"#fca5a5",marginTop:6}}>{importMsg}</div>}
+            <button onClick={doImport} disabled={!importText.trim()} style={{marginTop:8,width:"100%",background:importText.trim()?"#1d4ed8":"rgba(96,165,250,0.1)",border:"none",color:importText.trim()?"#fff":"#4b5563",borderRadius:6,padding:"10px",fontSize:12,cursor:"pointer",fontFamily:"'Courier New',monospace",fontWeight:700}}>LOAD DATA</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Detail({ hammer, onBack }) {
+  if (!hammer) return null;
+  const col = tc(hammer.strength);
+  return (
+    <div style={{flex:1,display:"flex",flexDirection:"column",overflowY:"auto"}}>
+      <div style={{padding:"12px 16px",borderBottom:"1px solid rgba(255,255,255,0.06)",display:"flex",alignItems:"center",gap:10,flexShrink:0}}>
+        <button onClick={onBack} style={{background:"none",border:"none",color:"#9ca3af",fontSize:22,cursor:"pointer",padding:0}}>←</button>
+        <div style={{flex:1}}>
+          <div style={{color:col,fontSize:10,letterSpacing:2,fontFamily:"'Courier New',monospace"}}>▶ HAMMER FILE</div>
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <span style={{fontSize:18}}>{raceEmoji(hammer.race)}</span>
+            <span style={{color:"#f3f4f6",fontSize:17,fontWeight:900,fontFamily:"'Courier New',monospace"}}>{hammer.player}</span>
+            {hammer.reinforcementWarning && <span>⚠️</span>}
+          </div>
+          <div style={{color:"#9ca3af",fontSize:12}}>
+            {hammer.alliance && <span style={{color:"#60a5fa"}}>{hammer.alliance} · </span>}
+            {hammer.villa}
+          </div>
+        </div>
+        <div style={{background:col+"22",color:col,fontSize:12,fontWeight:700,padding:"4px 12px",borderRadius:4,border:"1px solid "+col+"44",textTransform:"uppercase"}}>{hammer.strength||"UNKNOWN"}</div>
+      </div>
+      {hammer.reinforcementWarning && (
+        <div style={{margin:"10px 16px 0",background:"rgba(251,191,36,0.08)",border:"1px solid rgba(251,191,36,0.2)",borderRadius:7,padding:"8px 12px",fontSize:12,color:"#fbbf24"}}>
+          ⚠️ Scout report — may include same-race reinforcements. Cross-check crop usage.
+        </div>
+      )}
+      <div style={{padding:"12px 16px",display:"grid",gap:8}}>
+        {Object.entries(FIELDS).map(([key, label]) =>
+          hammer[key] && hammer[key] !== false ? (
+            <div key={key} style={{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:7,padding:"9px 13px"}}>
+              <div style={{color:"#6b7280",fontSize:10,letterSpacing:1,textTransform:"uppercase",marginBottom:3}}>{label}</div>
+              <div style={{color:"#e5e7eb",fontSize:13,fontFamily:key==="units"?"'Courier New',monospace":"inherit"}}>
+                {key==="source" ? srcLabel(hammer[key]) : String(hammer[key])}
+              </div>
+            </div>
+          ) : null
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ChatView({ messages, loading, input, setInput, sendMessage, retryLast, pendingImages, removeImage, fileInputRef, handleFileSelect }) {
+  const chatRef = useRef(null);
+  useEffect(() => { if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight; }, [messages, loading]);
+  return (
+    <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
+      <div ref={chatRef} style={{flex:1,overflowY:"auto",padding:"14px 14px 8px",display:"flex",flexDirection:"column",gap:10}}>
+        {messages.map((m, i) => (
+          <div key={i} style={{display:"flex",flexDirection:m.role==="user"?"row-reverse":"row",gap:8,alignItems:"flex-end"}}>
+            <div style={{width:30,height:30,borderRadius:"50%",flexShrink:0,background:m.role==="user"?"rgba(239,68,68,0.2)":"rgba(96,165,250,0.15)",border:"1px solid "+(m.role==="user"?"#ef444455":"#60a5fa44"),display:"flex",alignItems:"center",justifyContent:"center",fontSize:13}}>
+              {m.role==="user"?"⚔":"🔭"}
+            </div>
+            <div style={{maxWidth:"80%",display:"flex",flexDirection:"column",gap:4,alignItems:m.role==="user"?"flex-end":"flex-start"}}>
+              {(m.images||[]).map((src,j) => <img key={j} src={src} alt="" style={{maxWidth:200,maxHeight:140,borderRadius:8,border:"1px solid rgba(239,68,68,0.3)",objectFit:"cover"}}/>)}
+              {m.text && m.text !== "(screenshot)" && (
+                <div style={{background:m.role==="user"?"rgba(239,68,68,0.1)":"rgba(255,255,255,0.05)",border:"1px solid "+(m.role==="user"?"rgba(239,68,68,0.2)":"rgba(255,255,255,0.08)"),borderRadius:m.role==="user"?"16px 16px 4px 16px":"16px 16px 16px 4px",padding:"10px 14px",fontSize:13,lineHeight:1.6,color:m.error?"#fca5a5":"#d1d5db",whiteSpace:"pre-wrap",fontFamily:m.role==="assistant"?"'Courier New',monospace":"inherit"}}>
+                  {m.text}
+                  {m.error && <button onClick={retryLast} style={{display:"block",marginTop:8,background:"rgba(239,68,68,0.15)",border:"1px solid rgba(239,68,68,0.3)",color:"#fca5a5",borderRadius:6,padding:"4px 12px",fontSize:11,cursor:"pointer",fontFamily:"'Courier New',monospace"}}>↺ RETRY</button>}
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+        {loading && (
+          <div style={{display:"flex",gap:8,alignItems:"flex-end"}}>
+            <div style={{width:30,height:30,borderRadius:"50%",background:"rgba(96,165,250,0.15)",border:"1px solid #60a5fa44",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13}}>🔭</div>
+            <div style={{background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:"16px 16px 16px 4px",padding:"12px 16px"}}>
+              <div style={{display:"flex",gap:5}}>{[0,1,2].map(n=><div key={n} style={{width:7,height:7,borderRadius:"50%",background:"#60a5fa",animation:"bounce 1s "+(n*0.15)+"s infinite"}}/>)}</div>
+            </div>
+          </div>
+        )}
+      </div>
+      {pendingImages.length > 0 && (
+        <div style={{padding:"6px 14px",display:"flex",gap:8,flexWrap:"wrap",borderTop:"1px solid rgba(255,255,255,0.05)"}}>
+          {pendingImages.map((img,i) => (
+            <div key={i} style={{position:"relative"}}>
+              <img src={img.previewUrl} alt="" style={{width:56,height:56,objectFit:"cover",borderRadius:8,border:"1px solid rgba(239,68,68,0.4)"}}/>
+              <button onClick={() => removeImage(i)} style={{position:"absolute",top:-5,right:-5,width:20,height:20,borderRadius:"50%",background:"#ef4444",border:"none",color:"#fff",fontSize:13,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>×</button>
+            </div>
+          ))}
+        </div>
+      )}
+      <div style={{padding:"10px 12px",borderTop:"1px solid rgba(255,255,255,0.07)",display:"flex",gap:8,alignItems:"flex-end",background:"rgba(0,0,0,0.2)"}}>
+        <button onClick={() => fileInputRef.current && fileInputRef.current.click()} style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",color:"#9ca3af",borderRadius:10,width:42,height:42,flexShrink:0,cursor:"pointer",fontSize:18,display:"flex",alignItems:"center",justifyContent:"center"}}>📎</button>
+        <input ref={fileInputRef} type="file" accept="image/*" multiple onChange={handleFileSelect} style={{display:"none"}}/>
+        <textarea value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendMessage();}}} placeholder="Type intel or attach screenshot..." rows={1} style={{flex:1,background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:20,color:"#e5e7eb",padding:"10px 16px",fontSize:14,resize:"none",outline:"none",fontFamily:"inherit",lineHeight:1.4,maxHeight:100,overflowY:"auto"}}/>
+        <button onClick={sendMessage} disabled={loading||(!input.trim()&&pendingImages.length===0)} style={{background:(loading||(!input.trim()&&pendingImages.length===0))?"rgba(239,68,68,0.15)":"#ef4444",border:"none",color:(loading||(!input.trim()&&pendingImages.length===0))?"#6b7280":"#fff",borderRadius:10,width:42,height:42,flexShrink:0,cursor:"pointer",fontSize:18,display:"flex",alignItems:"center",justifyContent:"center",transition:"all 0.15s"}}>↑</button>
+      </div>
+    </div>
+  );
+}
+
+function DefView({ hammers }) {
+  const [query, setQuery] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [history, setHistory] = useState([{role:"assistant",text:"DEF LEAD BRIEFING READY.\n\n• \"Hit from (11|22)\"\n• \"Who hits with (100|200)?\"\n• \"All HIGH threats\"\n• \"Codex status\""}]);
+  const chatRef = useRef(null);
+  useEffect(() => { if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight; }, [history,loading]);
+
+  async function ask(q) {
+    q = (q||query).trim();
+    if (!q||loading) return;
+    setQuery("");
+    setHistory(h=>[...h,{role:"user",text:q}]);
+    setLoading(true);
+    const db = hammers.length ? "\n\nHAMMER DATABASE:\n"+JSON.stringify(hammers,null,2) : "\n\nHAMMER DATABASE: (empty)";
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1000,system:DEF_PROMPT+db,messages:[...history.map(m=>({role:m.role,content:m.text})),{role:"user",content:q}]})});
+      const data = await res.json();
+      const text = (data.content||[]).map(b=>b.text||"").join("")||"No response. Try again.";
+      setHistory(h=>[...h,{role:"assistant",text}]);
+    } catch(e) {
+      setHistory(h=>[...h,{role:"assistant",text:"⚠️ Connection error. Try again.",error:true}]);
+    }
+    setLoading(false);
+  }
+
+  return (
+    <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
+      <div style={{background:"rgba(239,68,68,0.08)",borderBottom:"1px solid rgba(239,68,68,0.15)",padding:"8px 14px",display:"flex",alignItems:"center",gap:8,flexShrink:0}}>
+        <div style={{width:6,height:6,borderRadius:"50%",background:"#ef4444",boxShadow:"0 0 6px #ef4444",animation:"pulse 1.5s infinite"}}/>
+        <div style={{fontFamily:"'Courier New',monospace",fontSize:11,color:"#ef4444",letterSpacing:1}}>DEF LEAD · {hammers.length} hammers</div>
+      </div>
+      <div style={{padding:"8px 12px",display:"flex",gap:6,flexWrap:"wrap",borderBottom:"1px solid rgba(255,255,255,0.05)",flexShrink:0}}>
+        {["All HIGH threats","List all hammers","Hammers dead soon"].map(chip=>(
+          <button key={chip} onClick={()=>ask(chip)} style={{background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.2)",color:"#fca5a5",borderRadius:20,padding:"5px 12px",fontSize:11,cursor:"pointer",fontFamily:"'Courier New',monospace"}}>{chip}</button>
+        ))}
+      </div>
+      <div ref={chatRef} style={{flex:1,overflowY:"auto",padding:"14px 14px 8px",display:"flex",flexDirection:"column",gap:10}}>
+        {history.map((m,i)=>(
+          <div key={i} style={{display:"flex",flexDirection:m.role==="user"?"row-reverse":"row",gap:8,alignItems:"flex-end"}}>
+            <div style={{width:30,height:30,borderRadius:"50%",flexShrink:0,background:m.role==="user"?"rgba(239,68,68,0.2)":"rgba(251,191,36,0.15)",border:"1px solid "+(m.role==="user"?"#ef444455":"#fbbf2444"),display:"flex",alignItems:"center",justifyContent:"center",fontSize:13}}>{m.role==="user"?"🛡":"⚡"}</div>
+            <div style={{maxWidth:"85%",background:m.role==="user"?"rgba(239,68,68,0.1)":"rgba(251,191,36,0.05)",border:"1px solid "+(m.role==="user"?"rgba(239,68,68,0.2)":"rgba(251,191,36,0.1)"),borderRadius:m.role==="user"?"16px 16px 4px 16px":"16px 16px 16px 4px",padding:"10px 14px",fontSize:13,lineHeight:1.7,color:"#d1d5db",whiteSpace:"pre-wrap",fontFamily:"'Courier New',monospace"}}>{m.text}</div>
+          </div>
+        ))}
+        {loading && (
+          <div style={{display:"flex",gap:8,alignItems:"flex-end"}}>
+            <div style={{width:30,height:30,borderRadius:"50%",background:"rgba(251,191,36,0.15)",border:"1px solid #fbbf2444",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13}}>⚡</div>
+            <div style={{background:"rgba(251,191,36,0.05)",border:"1px solid rgba(251,191,36,0.1)",borderRadius:"16px 16px 16px 4px",padding:"12px 16px"}}>
+              <div style={{display:"flex",gap:5}}>{[0,1,2].map(n=><div key={n} style={{width:7,height:7,borderRadius:"50%",background:"#fbbf24",animation:"bounce 1s "+(n*0.15)+"s infinite"}}/>)}</div>
+            </div>
+          </div>
+        )}
+      </div>
+      <div style={{padding:"10px 12px",borderTop:"1px solid rgba(255,255,255,0.07)",display:"flex",gap:8,alignItems:"flex-end",background:"rgba(0,0,0,0.2)"}}>
+        <textarea value={query} onChange={e=>setQuery(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();ask(query);}}} placeholder='e.g. "Hit from (11|22)"' rows={1} style={{flex:1,background:"rgba(255,255,255,0.06)",border:"1px solid rgba(251,191,36,0.2)",borderRadius:20,color:"#e5e7eb",padding:"10px 16px",fontSize:14,resize:"none",outline:"none",fontFamily:"inherit",lineHeight:1.4,maxHeight:100,overflowY:"auto"}}/>
+        <button onClick={()=>ask(query)} disabled={loading||!query.trim()} style={{background:loading||!query.trim()?"rgba(251,191,36,0.1)":"#d97706",border:"none",color:loading||!query.trim()?"#6b7280":"#fff",borderRadius:10,width:42,height:42,flexShrink:0,cursor:"pointer",fontSize:18,display:"flex",alignItems:"center",justifyContent:"center"}}>↑</button>
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [hammers, setHammers] = useState([]);
+  const [tab, setTab] = useState("chat");
+  const [detail, setDetail] = useState(null);
+  const [dbStatus, setDbStatus] = useState("loading");
+  const [messages, setMessages] = useState([{role:"assistant",text:"TRAVIAN WAR INTEL v1.1\n\nConnected to Google Sheets.\nTap 📎 to attach scout or battle screenshots.\nMissing coords? I'll ask before saving."}]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [pendingImages, setPendingImages] = useState([]);
+  const [lastPayload, setLastPayload] = useState(null);
+  const fileInputRef = useRef(null);
+
+  useEffect(() => {
+    loadHammers().then(d=>{setHammers(d);setDbStatus("ok");}).catch(()=>setDbStatus("error"));
+  }, []);
+
+  useEffect(() => {
+    const iv = setInterval(()=>loadHammers().then(d=>setHammers(d)).catch(()=>{}), 15000);
+    return ()=>clearInterval(iv);
+  }, []);
+
+  useEffect(() => {
+    const onPaste = e => {
+      const items = e.clipboardData ? e.clipboardData.items : [];
+      for (let i=0;i<items.length;i++) { if(items[i].type.startsWith("image/")) addImageFile(items[i].getAsFile()); }
+    };
+    window.addEventListener("paste", onPaste);
+    return ()=>window.removeEventListener("paste", onPaste);
+  }, []);
+
+  async function addImageFile(file) {
+    if (!file) return;
+    const base64 = await fileToBase64(file);
+    setPendingImages(p=>[...p,{base64,mediaType:file.type||"image/png",previewUrl:URL.createObjectURL(file)}]);
+  }
+
+  async function handleFileSelect(e) {
+    for (let i=0;i<e.target.files.length;i++) await addImageFile(e.target.files[i]);
+    e.target.value="";
+  }
+
+  function removeImage(idx) { setPendingImages(p=>p.filter((_,i)=>i!==idx)); }
+
+  async function sendMessage(override) {
+    const txt = override ? override.text : input.trim();
+    const imgs = override ? override.images : pendingImages;
+    if ((!txt && imgs.length===0)||loading) return;
+    if (!override) {
+      setMessages(m=>[...m,{role:"user",text:txt||"(screenshot)",images:imgs.map(i=>i.previewUrl)}]);
+      setInput(""); setPendingImages([]);
+    }
+    setLoading(true);
+    const payload = override||{text:txt,images:imgs};
+    setLastPayload(payload);
+    const ctx = hammers.length ? "\n\nCURRENT HAMMER DATABASE:\n"+JSON.stringify(hammers,null,2) : "\n\nCURRENT HAMMER DATABASE: (empty)";
+    const userContent = [];
+    payload.images.forEach(img=>userContent.push({type:"image",source:{type:"base64",media_type:img.mediaType,data:img.base64}}));
+    if (payload.text) userContent.push({type:"text",text:payload.text});
+    if (userContent.length===0) userContent.push({type:"text",text:"(screenshot provided)"});
+    const hist = messages.filter(m=>m.role==="user"||m.role==="assistant").slice(-10).map(m=>({role:m.role,content:m.text||"(image)"}));
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1200,system:SYSTEM_PROMPT+ctx,messages:[...hist,{role:"user",content:userContent}]})});
+      const data = await res.json();
+      if (data.error) throw new Error(data.error.message);
+      const raw = (data.content||[]).map(b=>b.text||"").join("");
+      if (!raw) throw new Error("Empty");
+      const {message,update} = parseAIResponse(raw);
+      if (update && !["none","need_info"].includes(update.action)) {
+        setHammers(prev=>{const next=applyUpdate(prev,update);saveHammers(next);return next;});
+      }
+      setMessages(m=>[...m,{role:"assistant",text:message}]);
+      setLastPayload(null);
+    } catch(e) {
+      const msg = e.message&&e.message.includes("overload")?"⚠️ Server busy — retry.":"⚠️ No response. Check connection and retry.";
+      setMessages(m=>[...m,{role:"assistant",text:msg,error:true}]);
+    }
+    setLoading(false);
+  }
+
+  function retryLast() { if(lastPayload) sendMessage(lastPayload); }
+
+  function handleCleanDB() {
+    const cleaned = hammers.filter(h=>h.villa&&h.villa.trim()&&h.player&&h.player.trim());
+    setHammers(cleaned); saveHammers(cleaned);
+    setMessages(m=>[...m,{role:"assistant",text:"🧹 Removed "+(hammers.length-cleaned.length)+" incomplete entries."}]);
+    setTab("chat");
+  }
+
+  function handleImport(data) {
+    const key = h=>(h.player+"__"+h.villa).toLowerCase();
+    const existing = new Set(hammers.map(key));
+    const toAdd = data.filter(h=>h.player&&h.villa&&!existing.has(key(h)));
+    const merged = [...hammers,...toAdd];
+    setHammers(merged); saveHammers(merged);
+  }
+
+  const TABS = [["chat","💬 Intel"],["list","🎯 Hammers"],["def","🛡 Def Lead"]];
+
+  if (detail) return (
+    <div style={{height:"100vh",background:"#0a0b0d",color:"#e5e7eb",display:"flex",flexDirection:"column"}}>
+      <Detail hammer={detail} onBack={()=>setDetail(null)}/>
+    </div>
+  );
+
+  return (
+    <div style={{height:"100vh",background:"#0a0b0d",color:"#e5e7eb",display:"flex",flexDirection:"column"}}>
+      <div style={{background:"rgba(239,68,68,0.06)",borderBottom:"1px solid rgba(239,68,68,0.2)",padding:"10px 16px",display:"flex",alignItems:"center",gap:10,flexShrink:0}}>
+        <div style={{width:8,height:8,borderRadius:"50%",background:"#ef4444",boxShadow:"0 0 8px #ef4444",animation:"pulse 2s infinite",flexShrink:0}}/>
+        <div style={{flex:1}}>
+          <div style={{fontFamily:"'Courier New',monospace",fontWeight:900,fontSize:13,letterSpacing:2,color:"#ef4444"}}>TRAVIAN WAR INTEL <span style={{fontSize:9,opacity:0.6}}>v1.1</span></div>
+          <div style={{fontSize:10,color:"#6b7280",letterSpacing:1}}>HAMMER TRACKING</div>
+        </div>
+        <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:4}}>
+          <div style={{display:"flex",alignItems:"center",gap:6}}>
+            <div style={{fontFamily:"'Courier New',monospace",fontSize:12,color:"#4b5563"}}>{hammers.length} tracked</div>
+            <div style={{display:"flex",alignItems:"center",gap:3}}>
+              <div style={{width:5,height:5,borderRadius:"50%",background:dbStatus==="ok"?"#22c55e":dbStatus==="loading"?"#f59e0b":"#ef4444"}}/>
+              <div style={{fontSize:9,color:"#4b5563",fontFamily:"'Courier New',monospace",letterSpacing:1}}>{dbStatus==="ok"?"📊 SHEETS":dbStatus==="loading"?"LOADING":"NO SYNC"}</div>
+            </div>
+          </div>
+          <ShareButton/>
+        </div>
+      </div>
+      <div style={{display:"flex",borderBottom:"1px solid rgba(255,255,255,0.06)",flexShrink:0}}>
+        {TABS.map(([t,label])=>(
+          <button key={t} onClick={()=>setTab(t)} style={{flex:1,padding:"11px 4px",background:"none",border:"none",borderBottom:tab===t?"2px solid "+(t==="def"?"#d97706":"#ef4444"):"2px solid transparent",color:tab===t?(t==="def"?"#fbbf24":"#ef4444"):"#6b7280",fontFamily:"'Courier New',monospace",fontSize:11,fontWeight:700,cursor:"pointer",letterSpacing:0.5,transition:"all 0.15s"}}>{label}</button>
+        ))}
+      </div>
+      <div style={{flex:1,overflow:"hidden",display:"flex",flexDirection:"column"}}>
+        {tab==="chat" && <ChatView messages={messages} loading={loading} input={input} setInput={setInput} sendMessage={()=>sendMessage(null)} retryLast={retryLast} pendingImages={pendingImages} removeImage={removeImage} fileInputRef={fileInputRef} handleFileSelect={handleFileSelect}/>}
+        {tab==="list" && <HammerList hammers={hammers} onSelect={setDetail} onCleanDB={handleCleanDB} onImport={handleImport}/>}
+        {tab==="def" && <DefView hammers={hammers}/>}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.render(React.createElement(App), document.getElementById("root"));
+</script>
+</body>
+</html>
