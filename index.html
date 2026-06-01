@@ -345,7 +345,7 @@ function DefView({ hammers }) {
     setLoading(true);
     const db = hammers.length ? "\n\nHAMMER DATABASE:\n"+JSON.stringify(hammers,null,2) : "\n\nHAMMER DATABASE: (empty)";
     try {
-      const res = await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":"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","anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1000,system:DEF_PROMPT+db,messages:[...history.map(m=>({role:m.role,content:m.text})),{role:"user",content:q}]})});
+      const res = await fetch("https://travian-proxy.jofpaulin.workers.dev",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1000,system:DEF_PROMPT+db,messages:[...history.map(m=>({role:m.role,content:m.text})),{role:"user",content:q}]})});
       const data = await res.json();
       const text = (data.content||[]).map(b=>b.text||"").join("")||"No response. Try again.";
       setHistory(h=>[...h,{role:"assistant",text}]);
@@ -452,7 +452,7 @@ function App() {
     if (userContent.length===0) userContent.push({type:"text",text:"(screenshot provided)"});
     const hist = messages.filter(m=>m.role==="user"||m.role==="assistant").slice(-10).map(m=>({role:m.role,content:m.text||"(image)"}));
     try {
-      const res = await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json","x-api-key":"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","anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1200,system:SYSTEM_PROMPT+ctx,messages:[...hist,{role:"user",content:userContent}]})});
+      const res = await fetch("https://travian-proxy.jofpaulin.workers.dev",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1200,system:SYSTEM_PROMPT+ctx,messages:[...hist,{role:"user",content:userContent}]})});
       const data = await res.json();
       if (data.error) throw new Error(data.error.message);
       const raw = (data.content||[]).map(b=>b.text||"").join("");
